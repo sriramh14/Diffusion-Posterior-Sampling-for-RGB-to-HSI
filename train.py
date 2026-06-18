@@ -32,7 +32,7 @@ from torch.utils.data import DataLoader
 
 from dataset.dataset_loader import ARADDataset
 from dataset.random_arad_loader import load_random_arad1k_samples
-from loss import compute_metrics, reconstruction_loss
+from loss import compute_metrics, mrae, psnr, reconstruction_loss, sam, ssim
 from models.dps_rgb2hsi_model import DPSRGB2HSI, ModelConfig
 
 
@@ -49,15 +49,15 @@ VAL_SEED = 1234
 DATA_ROOT = "data"
 HSI_KEY = "cube"
 DOWNLOAD_DATA = True
-TRAIN_IMAGES = 200
-TOTAL_IMAGES = 230
+TRAIN_IMAGES = 2
+TOTAL_IMAGES = 4
 EVAL_RANDOM_IMAGES = 50
 EVAL_RANDOM_TOTAL_IMAGES = 1000
 
 # Patch training keeps direct 31-channel diffusion practical. Validation and
 # evaluation still reconstruct the full 256x256 images from the loaders.
-TRAIN_PATCH_SIZE = 128
-USE_GEOMETRIC_AUGMENTATION = True
+TRAIN_PATCH_SIZE = 256
+USE_GEOMETRIC_AUGMENTATION = False
 BATCH_SIZE = 2
 VAL_BATCH_SIZE = 1
 NUM_WORKERS = 4
@@ -77,11 +77,20 @@ HSI_MAX = 1.0
 CLAMP_HSI_TO_CONFIG_RANGE = True
 
 # Training objective.
-# Noise-prediction MSE is the main DDPM objective. The small clean-HSI and
-# spectral-gradient terms stabilize a diffusion prior trained on a small set.
+# Noise-prediction MSE must remain the main DDPM objective. The additional
+# reconstruction terms are computed on the predicted clean HSI (x0). All four
+# functions are imported from the existing loss folder; they are not redefined here.
 LAMBDA_DIFFUSION = 1.0
-LAMBDA_X0_L1 = 0.10
-LAMBDA_SPECTRAL_GRAD = 0.05
+LAMBDA_MRAE = 0.10
+LAMBDA_SAM = 0.05
+LAMBDA_PSNR = 0.10
+LAMBDA_SSIM = 0.10
+
+# SAM is evaluated in radians so its scale is approximately [0, pi].
+# PSNR is converted to a minimization term as 10^(-PSNR/10). For data in [0,1],
+# this equals normalized MSE and stays non-negative.
+TRAIN_LOSS_DATA_RANGE = HSI_MAX - HSI_MIN
+SSIM_WINDOW_SIZE = 3
 
 # Validation reconstruction loss and metrics.
 RECONSTRUCTION_LOSS = "mrae"
@@ -803,8 +812,12 @@ def train() -> None:
         running = {
             "total": 0.0,
             "diffusion": 0.0,
-            "x0_l1": 0.0,
-            "spectral_grad": 0.0,
+            "mrae": 0.0,
+            "sam": 0.0,
+            "psnr_loss": 0.0,
+            "psnr": 0.0,
+            "ssim_loss": 0.0,
+            "ssim": 0.0,
         }
         train_count = 0
 
@@ -819,13 +832,43 @@ def train() -> None:
                 diffusion_outputs = model.training_losses(hsi)
                 diffusion_loss = diffusion_outputs["diffusion_loss"]
                 predicted_clean = diffusion_outputs["predicted_clean_hsi"]
-                x0_l1 = F.l1_loss(predicted_clean, hsi)
-                spectral_grad = spectral_gradient_loss(predicted_clean, hsi)
+
+                # Existing loss-folder functions; no metric is reimplemented here.
+                mrae_loss = mrae(
+                    predicted_clean,
+                    hsi,
+                    eps=MRAE_EPS,
+                    reduction="mean",
+                )
+                sam_loss = sam(
+                    predicted_clean,
+                    hsi,
+                    eps=MRAE_EPS,
+                    degrees=False,
+                )
+                psnr_value = psnr(
+                    predicted_clean,
+                    hsi,
+                    data_range=TRAIN_LOSS_DATA_RANGE,
+                )
+                psnr_loss = torch.pow(
+                    predicted_clean.new_tensor(10.0),
+                    -psnr_value / 10.0,
+                )
+                ssim_value = ssim(
+                    predicted_clean,
+                    hsi,
+                    data_range=TRAIN_LOSS_DATA_RANGE,
+                    window_size=SSIM_WINDOW_SIZE,
+                )
+                ssim_loss = 1.0 - ssim_value
 
                 total_loss = (
                     LAMBDA_DIFFUSION * diffusion_loss
-                    + LAMBDA_X0_L1 * x0_l1
-                    + LAMBDA_SPECTRAL_GRAD * spectral_grad
+                    + LAMBDA_MRAE * mrae_loss
+                    + LAMBDA_SAM * sam_loss
+                    + LAMBDA_PSNR * psnr_loss
+                    + LAMBDA_SSIM * ssim_loss
                 )
 
             scaler.scale(total_loss).backward()
@@ -843,8 +886,12 @@ def train() -> None:
             values = {
                 "total": total_loss,
                 "diffusion": diffusion_loss,
-                "x0_l1": x0_l1,
-                "spectral_grad": spectral_grad,
+                "mrae": mrae_loss,
+                "sam": sam_loss,
+                "psnr_loss": psnr_loss,
+                "psnr": psnr_value,
+                "ssim_loss": ssim_loss,
+                "ssim": ssim_value,
             }
             for name, value in values.items():
                 running[name] += float(value.item()) * batch_size
@@ -881,8 +928,12 @@ def train() -> None:
             f"Epoch {epoch}/{NUM_EPOCHS} "
             f"| Train Total {train_stats['total']:.6f} "
             f"| Diffusion {train_stats['diffusion']:.6f} "
-            f"| X0 L1 {train_stats['x0_l1']:.6f} "
-            f"| Spectral Grad {train_stats['spectral_grad']:.6f} "
+            f"| MRAE {train_stats['mrae']:.6f} "
+            f"| SAM(rad) {train_stats['sam']:.6f} "
+            f"| PSNR {train_stats['psnr']:.4f} "
+            f"| PSNR Loss {train_stats['psnr_loss']:.6f} "
+            f"| SSIM {train_stats['ssim']:.6f} "
+            f"| SSIM Loss {train_stats['ssim_loss']:.6f} "
             f"| Val Loss {val_results['loss']:.6f} "
             f"| Val MRAE {val_results['mrae']:.6f} "
             f"| Val RMSE {val_results['rmse']:.6f} "
