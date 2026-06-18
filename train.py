@@ -6,10 +6,10 @@ Edit the CONFIG section and run:
     python train.py --mode train
     python train.py --mode eval
 
-There are no training stages. The same optimization run learns:
-
-1. an unconditional 31-band HSI diffusion prior, and
-2. a differentiable HSI-to-RGB camera response used by DPS at inference.
+There are no training stages. The diffusion network learns an unconditional
+31-band HSI prior. Before the first epoch, a fixed affine HSI-to-RGB projection
+is estimated once from paired training pixels by ridge regression and stored in
+the model checkpoint. It is not optimized jointly with the diffusion network.
 
 The RGB image is deliberately not passed to the diffusion U-Net. During
 reconstruction it conditions reverse diffusion through the measurement-gradient
@@ -23,7 +23,7 @@ import math
 import random
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -56,9 +56,9 @@ EVAL_RANDOM_TOTAL_IMAGES = 1000
 
 # Patch training keeps direct 31-channel diffusion practical. Validation and
 # evaluation still reconstruct the full 256x256 images from the loaders.
-TRAIN_PATCH_SIZE = 256
-USE_GEOMETRIC_AUGMENTATION = False
-BATCH_SIZE = 4
+TRAIN_PATCH_SIZE = 128
+USE_GEOMETRIC_AUGMENTATION = True
+BATCH_SIZE = 2
 VAL_BATCH_SIZE = 1
 NUM_WORKERS = 4
 PIN_MEMORY = DEVICE == "cuda"
@@ -70,7 +70,7 @@ GRAD_CLIP_NORM = 1.0
 USE_AMP = True
 
 # ARAD reflectance cubes are normally in [0,1]. The diffusion data scaling and
-# camera model below assume this range. Disable clamping only after checking the
+# empirical RGB projection assume this range. Disable clamping only after checking the
 # actual min/max values in your .mat files and changing HSI_MIN/HSI_MAX.
 HSI_MIN = 0.0
 HSI_MAX = 1.0
@@ -82,8 +82,6 @@ CLAMP_HSI_TO_CONFIG_RANGE = True
 LAMBDA_DIFFUSION = 1.0
 LAMBDA_X0_L1 = 0.10
 LAMBDA_SPECTRAL_GRAD = 0.05
-LAMBDA_CAMERA_RGB = 0.10
-LAMBDA_SRF_SMOOTH = 1e-3
 
 # Validation reconstruction loss and metrics.
 RECONSTRUCTION_LOSS = "mrae"
@@ -114,15 +112,13 @@ DPS_GUIDANCE_SCALE = 0.5
 NORMALIZE_DPS_GUIDANCE = False
 CLIP_DENOISED = True
 
-# Camera response. If a measured 3x31 spectral response matrix is available,
-# set FIXED_SRF_PATH to a .npy file; otherwise a smooth positive SRF is learned
-# jointly from paired GT-HSI/RGB data in this same training run.
-FIXED_SRF_PATH: Optional[Union[str, Path]] = None
-TRAINABLE_SRF = FIXED_SRF_PATH is None
-TRAINABLE_CAMERA_GAIN = True
-TRAINABLE_CAMERA_GAMMA = True
-USE_CAMERA_GAMMA = True
-CAMERA_GAMMA_INIT = 2.2
+# Fixed data-derived HSI->RGB operator for DPS. It is estimated once from paired
+# training pixels with ridge regression, then frozen and stored in checkpoints.
+# This is only a dataset calibration; there is no physical response or rendering module.
+RGB_OPERATOR_MAX_IMAGES: Optional[int] = TRAIN_IMAGES
+RGB_OPERATOR_PIXELS_PER_IMAGE = 4096
+RGB_OPERATOR_RIDGE = 1e-4
+RGB_OPERATOR_SEED = 2026
 
 # Full DPS validation is considerably more expensive than a feed-forward model.
 # Set VAL_MAX_IMAGES=None for the complete validation split.
@@ -215,24 +211,11 @@ def make_model_config() -> ModelConfig:
         guidance_scale=DPS_GUIDANCE_SCALE,
         normalize_guidance=NORMALIZE_DPS_GUIDANCE,
         clip_denoised=CLIP_DENOISED,
-        trainable_srf=TRAINABLE_SRF,
-        trainable_camera_gain=TRAINABLE_CAMERA_GAIN,
-        trainable_camera_gamma=TRAINABLE_CAMERA_GAMMA,
-        use_camera_gamma=USE_CAMERA_GAMMA,
-        camera_gamma_init=CAMERA_GAMMA_INIT,
     )
 
 
 def build_model(config: ModelConfig, device: torch.device) -> DPSRGB2HSI:
-    model = DPSRGB2HSI(config).to(device)
-    if FIXED_SRF_PATH is not None:
-        path = Path(FIXED_SRF_PATH)
-        if not path.exists():
-            raise FileNotFoundError(f"FIXED_SRF_PATH not found: {path}")
-        matrix = torch.from_numpy(np.load(path)).float()
-        model.load_fixed_srf(matrix)
-        print(f"Loaded and froze measured camera SRF: {path}")
-    return model
+    return DPSRGB2HSI(config).to(device)
 
 
 # ==================================================
@@ -518,6 +501,96 @@ def make_dataloaders(device: torch.device) -> Tuple[Optional[DataLoader], DataLo
     return train_loader, val_loader
 
 
+
+# ==================================================
+# FIXED DATA-DERIVED RGB OPERATOR
+# ==================================================
+
+
+@torch.no_grad()
+def estimate_rgb_operator(
+    train_loader: DataLoader,
+    *,
+    num_bands: int,
+    max_images: Optional[int],
+    pixels_per_image: int,
+    ridge: float,
+    seed: int,
+) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    """Fit RGB = W @ HSI + b once using sampled paired training pixels.
+
+    Only the small normal-equation matrices are accumulated, so this does not
+    keep millions of image pixels in memory. The returned W and b are fixed
+    model buffers and are never updated by the optimizer.
+    """
+    if pixels_per_image <= 0:
+        raise ValueError("RGB_OPERATOR_PIXELS_PER_IMAGE must be positive")
+    if ridge < 0:
+        raise ValueError("RGB_OPERATOR_RIDGE cannot be negative")
+
+    feature_dim = int(num_bands) + 1  # extra constant feature for the bias
+    xtx = torch.zeros(feature_dim, feature_dim, dtype=torch.float64)
+    xty = torch.zeros(feature_dim, 3, dtype=torch.float64)
+    yy = torch.zeros((), dtype=torch.float64)
+    pixel_count = 0
+    image_count = 0
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+
+    for batch in train_loader:
+        rgb, hsi, _, _ = unpack_batch(batch)
+        hsi = prepare_hsi(hsi).cpu()
+        rgb = rgb.cpu()
+
+        for sample_index in range(hsi.shape[0]):
+            if max_images is not None and image_count >= max_images:
+                break
+
+            x = hsi[sample_index].permute(1, 2, 0).reshape(-1, num_bands)
+            y = rgb[sample_index].permute(1, 2, 0).reshape(-1, 3)
+            available = x.shape[0]
+            sample_count = min(int(pixels_per_image), int(available))
+            if sample_count < available:
+                indices = torch.randperm(available, generator=generator)[:sample_count]
+                x = x[indices]
+                y = y[indices]
+
+            x = x.to(torch.float64)
+            y = y.to(torch.float64)
+            ones = torch.ones(x.shape[0], 1, dtype=torch.float64)
+            design = torch.cat((x, ones), dim=1)
+            xtx.add_(design.transpose(0, 1) @ design)
+            xty.add_(design.transpose(0, 1) @ y)
+            yy.add_(y.square().sum())
+            pixel_count += x.shape[0]
+            image_count += 1
+
+        if max_images is not None and image_count >= max_images:
+            break
+
+    if pixel_count == 0:
+        raise RuntimeError("No paired pixels were available to estimate the RGB operator")
+
+    regularizer = torch.eye(feature_dim, dtype=torch.float64) * float(ridge)
+    regularizer[-1, -1] = 0.0  # do not regularize the intercept
+    system = xtx + regularizer
+    try:
+        coefficients = torch.linalg.solve(system, xty)
+    except RuntimeError:
+        coefficients = torch.linalg.pinv(system) @ xty
+
+    prediction_error = (
+        yy
+        - 2.0 * torch.sum(coefficients * xty)
+        + torch.sum(coefficients * (xtx @ coefficients))
+    )
+    rmse = torch.sqrt((prediction_error / (pixel_count * 3)).clamp_min(0.0))
+
+    weight = coefficients[:-1].transpose(0, 1).float().contiguous()
+    bias = coefficients[-1].float().contiguous()
+    return weight, bias, float(rmse.item())
+
+
 # ==================================================
 # CHECKPOINTS
 # ==================================================
@@ -612,7 +685,7 @@ def validate(
             guidance_scale=guidance_scale,
             generator=eval_generator,
         )
-        pred_rgb = model.camera(pred_hsi)
+        pred_rgb = model.project_hsi_to_rgb(pred_hsi)
 
         for sample_index in range(rgb.shape[0]):
             sample_pred, sample_hsi = crop_sample(
@@ -703,13 +776,27 @@ def train() -> None:
         best_val_loss = float(resume.get("best_val_loss", math.inf))
         epochs_without_improvement = int(resume.get("epochs_without_improvement", 0))
         print(f"Resumed from epoch {start_epoch}")
+    else:
+        operator_weight, operator_bias, operator_rmse = estimate_rgb_operator(
+            train_loader,
+            num_bands=NUM_BANDS,
+            max_images=RGB_OPERATOR_MAX_IMAGES,
+            pixels_per_image=RGB_OPERATOR_PIXELS_PER_IMAGE,
+            ridge=RGB_OPERATOR_RIDGE,
+            seed=RGB_OPERATOR_SEED,
+        )
+        model.set_rgb_operator(operator_weight, operator_bias)
+        print(
+            "Estimated and froze the dataset RGB operator "
+            f"from paired training pixels (fit RMSE: {operator_rmse:.6f})."
+        )
 
     print(f"Device: {device}")
     print(f"Training samples: {len(train_loader.dataset)}")
     print(f"Validation samples: {len(val_loader.dataset)}")
     print(f"Trainable parameters: {count_trainable_parameters(model):,}")
     print(f"Model configuration: {config.to_dict()}")
-    print("Training is single-stage; RGB is used by the camera loss and DPS sampler.")
+    print("Training is single-stage; RGB is used only to calibrate the fixed DPS operator and during sampling.")
 
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
         model.train()
@@ -718,17 +805,14 @@ def train() -> None:
             "diffusion": 0.0,
             "x0_l1": 0.0,
             "spectral_grad": 0.0,
-            "camera_rgb": 0.0,
-            "srf_smooth": 0.0,
         }
         train_count = 0
 
         for batch in train_loader:
             rgb, hsi, _, _ = unpack_batch(batch)
-            rgb, hsi = random_crop_and_augment(rgb, hsi, TRAIN_PATCH_SIZE)
-            rgb = rgb.to(device, non_blocking=(device.type == "cuda"))
+            _, hsi = random_crop_and_augment(rgb, hsi, TRAIN_PATCH_SIZE)
             hsi = prepare_hsi(hsi).to(device, non_blocking=(device.type == "cuda"))
-            batch_size = rgb.shape[0]
+            batch_size = hsi.shape[0]
             optimizer.zero_grad(set_to_none=True)
 
             with autocast_context(amp_enabled):
@@ -737,15 +821,11 @@ def train() -> None:
                 predicted_clean = diffusion_outputs["predicted_clean_hsi"]
                 x0_l1 = F.l1_loss(predicted_clean, hsi)
                 spectral_grad = spectral_gradient_loss(predicted_clean, hsi)
-                camera_rgb = F.l1_loss(model.camera(hsi), rgb)
-                srf_smooth = model.camera_regularization_loss()
 
                 total_loss = (
                     LAMBDA_DIFFUSION * diffusion_loss
                     + LAMBDA_X0_L1 * x0_l1
                     + LAMBDA_SPECTRAL_GRAD * spectral_grad
-                    + LAMBDA_CAMERA_RGB * camera_rgb
-                    + LAMBDA_SRF_SMOOTH * srf_smooth
                 )
 
             scaler.scale(total_loss).backward()
@@ -765,8 +845,6 @@ def train() -> None:
                 "diffusion": diffusion_loss,
                 "x0_l1": x0_l1,
                 "spectral_grad": spectral_grad,
-                "camera_rgb": camera_rgb,
-                "srf_smooth": srf_smooth,
             }
             for name, value in values.items():
                 running[name] += float(value.item()) * batch_size
@@ -805,7 +883,6 @@ def train() -> None:
             f"| Diffusion {train_stats['diffusion']:.6f} "
             f"| X0 L1 {train_stats['x0_l1']:.6f} "
             f"| Spectral Grad {train_stats['spectral_grad']:.6f} "
-            f"| Camera RGB {train_stats['camera_rgb']:.6f} "
             f"| Val Loss {val_results['loss']:.6f} "
             f"| Val MRAE {val_results['mrae']:.6f} "
             f"| Val RMSE {val_results['rmse']:.6f} "
