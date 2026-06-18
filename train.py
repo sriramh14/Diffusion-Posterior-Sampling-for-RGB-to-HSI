@@ -49,16 +49,16 @@ VAL_SEED = 1234
 DATA_ROOT = "data"
 HSI_KEY = "cube"
 DOWNLOAD_DATA = True
-TRAIN_IMAGES = 200
-TOTAL_IMAGES = 230
+TRAIN_IMAGES = 2
+TOTAL_IMAGES = 4
 EVAL_RANDOM_IMAGES = 50
 EVAL_RANDOM_TOTAL_IMAGES = 1000
 
 # Patch training keeps direct 31-channel diffusion practical. Validation and
 # evaluation still reconstruct the full 256x256 images from the loaders.
-TRAIN_PATCH_SIZE = 128
-USE_GEOMETRIC_AUGMENTATION = True
-BATCH_SIZE = 2
+TRAIN_PATCH_SIZE = 256
+USE_GEOMETRIC_AUGMENTATION = False
+BATCH_SIZE = 4
 VAL_BATCH_SIZE = 1
 NUM_WORKERS = 4
 PIN_MEMORY = DEVICE == "cuda"
