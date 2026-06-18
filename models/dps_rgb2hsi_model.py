@@ -5,7 +5,8 @@ The model follows the central idea of Chung et al., "Diffusion Posterior
 Sampling for General Noisy Inverse Problems" (ICLR 2023):
 
 1. Train an unconditional diffusion prior p(x) on clean hyperspectral cubes x.
-2. Define a differentiable measurement operator A that maps HSI to RGB.
+2. Estimate once, from paired training data, a fixed differentiable linear
+   operator A that maps HSI to the dataset RGB representation.
 3. At inference, guide every reverse-diffusion step with the gradient of
    ||y - A(x_0_hat)||, where y is the observed RGB image.
 
@@ -19,7 +20,7 @@ from __future__ import annotations
 import math
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -63,26 +64,14 @@ class ModelConfig:
     normalize_guidance: bool = False
     clip_denoised: bool = True
 
-    # Differentiable HSI -> RGB measurement operator.
-    wavelengths_nm: Tuple[float, ...] = tuple(float(v) for v in range(400, 701, 10))
-    trainable_srf: bool = True
-    trainable_camera_gain: bool = True
-    trainable_camera_gamma: bool = True
-    use_camera_gamma: bool = True
-    camera_gamma_init: float = 2.2
+    # The HSI->RGB operator is a fixed data-derived linear projection stored
+    # as model buffers. It has no trainable measurement-model parameters.
 
     def __post_init__(self) -> None:
         self.channel_mults = tuple(int(v) for v in self.channel_mults)
         self.attention_levels = tuple(int(v) for v in self.attention_levels)
-        self.wavelengths_nm = tuple(float(v) for v in self.wavelengths_nm)
-
         if self.num_bands <= 0:
             raise ValueError("num_bands must be positive")
-        if len(self.wavelengths_nm) != self.num_bands:
-            raise ValueError(
-                "wavelengths_nm must contain exactly num_bands values; "
-                f"received {len(self.wavelengths_nm)} and {self.num_bands}."
-            )
         if self.hsi_max <= self.hsi_min:
             raise ValueError("hsi_max must be greater than hsi_min")
         if self.base_channels <= 0 or self.num_res_blocks <= 0:
@@ -105,7 +94,7 @@ class ModelConfig:
             raise TypeError("ModelConfig.from_dict expects a dictionary")
         valid_names = {item.name for item in fields(cls)}
         filtered = {key: value for key, value in values.items() if key in valid_names}
-        for tuple_name in ("channel_mults", "attention_levels", "wavelengths_nm"):
+        for tuple_name in ("channel_mults", "attention_levels"):
             if tuple_name in filtered:
                 filtered[tuple_name] = tuple(filtered[tuple_name])
         return cls(**filtered)
@@ -134,12 +123,6 @@ def _zero_module(module: nn.Module) -> nn.Module:
     for parameter in module.parameters():
         nn.init.zeros_(parameter)
     return module
-
-
-def _inverse_softplus(value: float) -> float:
-    if value <= 0:
-        raise ValueError("inverse softplus input must be positive")
-    return math.log(math.expm1(value))
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -431,106 +414,85 @@ class DenoiserUNet(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Differentiable HSI -> RGB forward operator
+# Fixed data-derived HSI -> RGB forward operator
 # -----------------------------------------------------------------------------
 
 
-class SpectralResponseOperator(nn.Module):
-    """Physically constrained, differentiable camera response model.
+class LinearRGBOperator(nn.Module):
+    """Fixed affine HSI-to-RGB projection used as the DPS forward operator.
 
-    Each RGB response curve is non-negative and sums to one across the 31
-    wavelengths. Optional positive channel gains and gamma correction absorb
-    differences between linear HSI intensity and rendered/JPEG RGB values.
+    This is an empirical dataset projection. The projection matrix and
+    bias are estimated once from paired training HSI/RGB pixels using ridge
+    regression, copied into buffers, and then kept fixed for all diffusion
+    training and DPS reconstruction.
     """
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, num_bands: int):
         super().__init__()
-        self.config = config
-        wavelengths = torch.tensor(config.wavelengths_nm, dtype=torch.float32)
-        self.register_buffer("wavelengths_nm", wavelengths, persistent=True)
+        self.num_bands = int(num_bands)
+        if self.num_bands <= 0:
+            raise ValueError("num_bands must be positive")
 
-        # Broad camera-like initialization: red, green, blue response peaks.
-        centers = torch.tensor([610.0, 540.0, 460.0], dtype=torch.float32)
-        widths = torch.tensor([45.0, 40.0, 35.0], dtype=torch.float32)
-        response = torch.exp(
-            -0.5
-            * ((wavelengths[None, :] - centers[:, None]) / widths[:, None]).square()
+        # Safe fallback before dataset calibration: average contiguous thirds
+        # of the spectral channels into B, G, R-like groups. Training replaces
+        # these values with the least-squares fit before the first epoch.
+        weight = torch.zeros(3, self.num_bands, dtype=torch.float32)
+        boundaries = torch.linspace(0, self.num_bands, 4).round().long()
+        # RGB channel order is red, green, blue; spectral bands are assumed to
+        # be ordered from lower-index to higher-index spectral bands.
+        groups = (
+            range(int(boundaries[2]), int(boundaries[3])),
+            range(int(boundaries[1]), int(boundaries[2])),
+            range(int(boundaries[0]), int(boundaries[1])),
         )
-        response = response / response.sum(dim=1, keepdim=True)
-        self.response_logits = nn.Parameter(
-            torch.log(response.clamp_min(1e-8)),
-            requires_grad=config.trainable_srf,
-        )
+        for channel, indices in enumerate(groups):
+            indices = list(indices)
+            if not indices:
+                indices = [min(channel, self.num_bands - 1)]
+            weight[channel, indices] = 1.0 / len(indices)
 
-        self.raw_gain = nn.Parameter(
-            torch.full((3,), _inverse_softplus(1.0), dtype=torch.float32),
-            requires_grad=config.trainable_camera_gain,
-        )
-        gamma_offset = max(config.camera_gamma_init - 0.5, 1e-3)
-        self.raw_gamma = nn.Parameter(
-            torch.full(
-                (3,), _inverse_softplus(gamma_offset), dtype=torch.float32
-            ),
-            requires_grad=config.trainable_camera_gamma,
-        )
+        self.register_buffer("weight", weight, persistent=True)
+        self.register_buffer("bias", torch.zeros(3, dtype=torch.float32), persistent=True)
 
-    def response_matrix(self) -> torch.Tensor:
-        """Return the current [3, 31] non-negative normalized SRF matrix."""
-        return self.response_logits.softmax(dim=1)
-
-    def gains(self) -> torch.Tensor:
-        return F.softplus(self.raw_gain).clamp_min(1e-4)
-
-    def gammas(self) -> torch.Tensor:
-        return 0.5 + F.softplus(self.raw_gamma)
-
-    def set_response_matrix(
+    def set_projection(
         self,
-        matrix: torch.Tensor,
-        *,
-        trainable: Optional[bool] = None,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
     ) -> None:
-        """Initialize/fix the response from a user-provided [3,31] matrix."""
-        value = torch.as_tensor(matrix, dtype=self.response_logits.dtype)
-        if value.shape == (self.config.num_bands, 3):
+        value = torch.as_tensor(weight, dtype=self.weight.dtype)
+        if value.shape == (self.num_bands, 3):
             value = value.transpose(0, 1)
-        expected = (3, self.config.num_bands)
+        expected = (3, self.num_bands)
         if tuple(value.shape) != expected:
             raise ValueError(
-                f"Response matrix must have shape {expected} or its transpose; "
+                f"Projection weight must have shape {expected} or its transpose; "
                 f"received {tuple(value.shape)}."
             )
-        value = value.clamp_min(0)
-        if torch.any(value.sum(dim=1) <= 0):
-            raise ValueError("Every RGB response row must contain positive mass")
-        value = value / value.sum(dim=1, keepdim=True)
-        with torch.no_grad():
-            self.response_logits.copy_(
-                torch.log(value.clamp_min(1e-8)).to(self.response_logits.device)
-            )
-        if trainable is not None:
-            self.response_logits.requires_grad_(bool(trainable))
 
-    def smoothness_loss(self) -> torch.Tensor:
-        response = self.response_matrix()
-        if response.shape[1] < 3:
-            return response.new_zeros(())
-        second_difference = response[:, 2:] - 2.0 * response[:, 1:-1] + response[:, :-2]
-        return second_difference.square().mean()
+        if bias is None:
+            bias_value = torch.zeros(3, dtype=self.bias.dtype)
+        else:
+            bias_value = torch.as_tensor(bias, dtype=self.bias.dtype).reshape(-1)
+            if tuple(bias_value.shape) != (3,):
+                raise ValueError(
+                    f"Projection bias must have shape (3,), received {tuple(bias_value.shape)}."
+                )
+
+        if not torch.isfinite(value).all() or not torch.isfinite(bias_value).all():
+            raise ValueError("Projection weight and bias must contain only finite values")
+
+        with torch.no_grad():
+            self.weight.copy_(value.to(device=self.weight.device))
+            self.bias.copy_(bias_value.to(device=self.bias.device))
 
     def forward(self, hsi: torch.Tensor) -> torch.Tensor:
-        if hsi.ndim != 4 or hsi.shape[1] != self.config.num_bands:
+        if hsi.ndim != 4 or hsi.shape[1] != self.num_bands:
             raise ValueError(
-                f"Expected HSI [B,{self.config.num_bands},H,W], "
-                f"received {tuple(hsi.shape)}"
+                f"Expected HSI [B,{self.num_bands},H,W], received {tuple(hsi.shape)}"
             )
-        response = self.response_matrix().to(dtype=hsi.dtype)
-        rgb_linear = torch.einsum("bchw,rc->brhw", hsi, response)
-        rgb_linear = rgb_linear * self.gains().to(hsi.dtype)[None, :, None, None]
-        if self.config.use_camera_gamma:
-            gamma = self.gammas().to(hsi.dtype)[None, :, None, None]
-            rgb_linear = rgb_linear.clamp_min(1e-6).pow(1.0 / gamma)
-        return rgb_linear
+        weight = self.weight.to(dtype=hsi.dtype)
+        bias = self.bias.to(dtype=hsi.dtype)
+        return torch.einsum("bchw,rc->brhw", hsi, weight) + bias[None, :, None, None]
 
 
 # -----------------------------------------------------------------------------
@@ -559,7 +521,7 @@ class DPSRGB2HSI(nn.Module):
         super().__init__()
         self.config = config if config is not None else ModelConfig()
         self.denoiser = DenoiserUNet(self.config)
-        self.camera = SpectralResponseOperator(self.config)
+        self.rgb_operator = LinearRGBOperator(self.config.num_bands)
 
         if self.config.beta_schedule.lower() == "cosine":
             betas = _cosine_beta_schedule(self.config.diffusion_timesteps)
@@ -719,7 +681,7 @@ class DPSRGB2HSI(nn.Module):
         normalize_guidance: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         predicted_clean_hsi = self.denormalize_hsi(predicted_clean_normalized)
-        predicted_rgb = self.camera(predicted_clean_hsi)
+        predicted_rgb = self.rgb_operator(predicted_clean_hsi)
         residual = observed_rgb - predicted_rgb
 
         # The official DPS implementation uses the L2 norm of the measurement
@@ -758,7 +720,7 @@ class DPSRGB2HSI(nn.Module):
             rgb: Observed RGB tensor [B,3,H,W], expected in approximately [0,1].
             sampling_steps: Number of spaced DDIM reverse steps.
             guidance_scale: DPS likelihood-gradient step size. This usually needs
-                tuning for a new camera response/dataset.
+                tuning for a new dataset/operator calibration.
             ddim_eta: 0 gives deterministic DDIM transitions; >0 adds noise.
             normalize_guidance: Normalize each likelihood gradient by its RMS.
             initial_noise: Optional reproducible [B,31,H,W] starting sample.
@@ -902,9 +864,14 @@ class DPSRGB2HSI(nn.Module):
             return output, diagnostics
         return output
 
-    def camera_regularization_loss(self) -> torch.Tensor:
-        return self.camera.smoothness_loss()
+    def project_hsi_to_rgb(self, hsi: torch.Tensor) -> torch.Tensor:
+        """Apply the fixed dataset-calibrated HSI-to-RGB projection."""
+        return self.rgb_operator(hsi)
 
-    def load_fixed_srf(self, matrix: torch.Tensor) -> None:
-        """Load a known [3,31] camera SRF and freeze it."""
-        self.camera.set_response_matrix(matrix, trainable=False)
+    def set_rgb_operator(
+        self,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Store a fixed data-derived RGB projection in the model buffers."""
+        self.rgb_operator.set_projection(weight, bias)
