@@ -123,7 +123,7 @@ MIN_LR = 1e-7
 # Composite prior objective. The noise-prediction MSE remains dominant.
 # Each function below comes from the repository's existing loss folder.
 LAMBDA_DIFFUSION = 1.0
-LAMBDA_MRAE = 0.05
+LAMBDA_MRAE = 0.5
 LAMBDA_SAM = 0.01
 LAMBDA_PSNR = 0.05
 LAMBDA_SSIM = 0.05
