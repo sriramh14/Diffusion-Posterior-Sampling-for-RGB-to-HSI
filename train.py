@@ -124,9 +124,9 @@ MIN_LR = 1e-7
 # Each function below comes from the repository's existing loss folder.
 LAMBDA_DIFFUSION = 1.0
 LAMBDA_MRAE = 0.75
-LAMBDA_SAM = 0.01
-LAMBDA_PSNR = 0.05
-LAMBDA_SSIM = 0.05
+LAMBDA_SAM = 0.4
+LAMBDA_PSNR = 0.3
+LAMBDA_SSIM = 0.1
 
 # DPS reconstruction.
 SAMPLING_STEPS = 50
