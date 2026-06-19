@@ -1,5 +1,0 @@
-numpy
-scipy
-Pillow
-huggingface_hub
-torch
